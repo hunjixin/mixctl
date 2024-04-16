@@ -1,0 +1,7 @@
+version: 0.1
+
+rules:
+- name: subspace-node
+  from: 0.0.0.0:9944
+  to:
+    - 192.168.3.163:9944

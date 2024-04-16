@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
 	"net"
 	"os"
 	"sync"
@@ -118,10 +117,6 @@ Flags:
 }
 
 func forward(name, from string, to []string, verbose bool, dialTimeout time.Duration) error {
-	seed := time.Now().UnixNano()
-
-	localRand := rand.New(rand.NewSource(seed))
-
 	fmt.Printf("Listening on: %s\n", from)
 	l, err := net.Listen("tcp", from)
 	if err != nil {
@@ -139,13 +134,68 @@ func forward(name, from string, to []string, verbose bool, dialTimeout time.Dura
 
 		// pick randomly from the list of upstream servers
 		// available
-		index := localRand.Intn(len(to))
-		upstream := to[index]
+		upstream, err := selectFineStream(context.Background(), to)
+		if err != nil {
+			return fmt.Errorf("error accepting connection %s", err.Error())
+		}
 
 		// A separate Goroutine means the loop can accept another
 		// incoming connection on the local address
 		go connect(local, upstream, from, verbose, dialTimeout)
 	}
+}
+
+func selectFineStream(ctx context.Context, urls []string) (string, error) {
+	for _, url := range urls {
+		if checkStreamOk(ctx, url) {
+			return url, nil
+		}
+	}
+	return "", fmt.Errorf("no one is okay")
+}
+
+func checkStreamOk(ctx context.Context, url string) bool {
+	client := NewSubpsaceClient("http://" + url)
+	farmInfo, err := client.GetFarmerAppInfo(ctx)
+	if err != nil {
+		return false
+	}
+	return !farmInfo.Syncing
+}
+
+func monitorStream(ctx context.Context, cancel context.CancelFunc, url string) {
+	client := NewSubpsaceClient("http://" + url)
+	go func() {
+		var firstT *time.Time
+		for {
+			farmInfo, err := client.GetFarmerAppInfo(ctx)
+			if err != nil {
+				log.Println(url, "request subspace node fail ", err)
+				cancel() //close
+				return
+			}
+
+			if farmInfo.Syncing {
+				if firstT == nil {
+					t := time.Now()
+					firstT = &t
+					log.Println("检测到同步错误", url)
+				} else {
+					if time.Since(*firstT) > time.Minute*10 {
+						log.Println("节点同步持续10分钟不同步，关闭连接 ", url)
+						cancel()
+						return
+					}
+				}
+				continue
+			} else {
+				firstT = nil
+			}
+
+			log.Println("节点正常 ", url)
+			time.Sleep(time.Minute)
+		}
+	}()
 }
 
 // connect dials the upstream address, then copies data
@@ -169,8 +219,10 @@ func connect(local net.Conn, upstreamAddr, from string, verbose bool, dialTimeou
 			local.RemoteAddr().String())
 	}
 
-	ctx := context.Background()
-	if err := copy(ctx, local, upstream); err != nil && err.Error() != "done" {
+	ctx, cancel := context.WithCancel(context.Background())
+	monitorStream(ctx, cancel, upstreamAddr)
+
+	if err := copy(ctx, cancel, local, upstream); err != nil && err.Error() != "done" {
 		log.Printf("error forwarding connection %s", err.Error())
 	}
 
@@ -185,9 +237,7 @@ func connect(local net.Conn, upstreamAddr, from string, verbose bool, dialTimeou
 // copy copies data between two connections using io.Copy
 // and will exit when either connection is closed or runs
 // into an error
-func copy(ctx context.Context, from, to net.Conn) error {
-
-	ctx, cancel := context.WithCancel(ctx)
+func copy(ctx context.Context, cancel context.CancelFunc, from, to net.Conn) error {
 	errgrp, _ := errgroup.WithContext(ctx)
 	errgrp.Go(func() error {
 		io.Copy(from, to)
